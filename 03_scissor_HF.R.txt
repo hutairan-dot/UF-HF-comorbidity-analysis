@@ -1,0 +1,81 @@
+# ==============================================================================
+# Script: 03_scissor_HF.R
+# Purpose: Map HF bulk phenotype (GSE57338) onto single-cell data (GSE298023)
+#          using Scissor (v1.0.0), alpha = 0.01, binomial family.
+# Phenotype: ICM + DCM -> HF = 1 ; Normal donor -> 0
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat); library(Scissor); library(Matrix)
+})
+set.seed(1234)
+
+config <- list(
+  sc_rds       = "GSE298023_processed_v2.rds",
+  bulk_txt     = "GSE57338_expression_matrix.txt",
+  clinical_csv = "GSE57338_clinical.csv",   # columns: Sample, Group
+  out_rds      = "GSE298023_Scissor_projected_alpha0001.rds",
+  out_scissor  = "scissor_res_HF_alpha0001.rds",
+  log_dir      = "logs",
+  alpha = 0.01, family = "binomial", nfold = 10, ncore = 8,
+  hf_labels    = c("ICM", "DCM"),   # disease groups
+  ctrl_label   = "Normal"
+)
+
+dir.create(config$log_dir, showWarnings = FALSE, recursive = TRUE)
+log_con <- file(file.path(config$log_dir, "scissor_HF_run_info.txt"), open = "wt")
+log_msg <- function(...) {
+  msg <- paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "] ", ...)
+  cat(msg, "\n"); cat(msg, "\n", file = log_con)
+}
+
+## 1. Single-cell
+hf_processed <- readRDS(config$sc_rds)
+hf_processed <- JoinLayers(hf_processed)
+sc_data <- GetAssayData(hf_processed, assay = "RNA", layer = "data")
+sc_data <- as(sc_data, "CsparseMatrix")
+log_msg("SC matrix: ", nrow(sc_data), " genes x ", ncol(sc_data), " cells")
+
+## 2. Bulk + phenotype
+bulk_expr <- read.table(config$bulk_txt, header = TRUE, row.names = 1,
+                        sep = "\t", check.names = FALSE)
+bulk_expr <- as.matrix(bulk_expr); storage.mode(bulk_expr) <- "numeric"
+clinical  <- read.csv(config$clinical_csv, stringsAsFactors = FALSE)
+stopifnot(all(c("Sample", "Group") %in% colnames(clinical)))
+
+idx <- match(colnames(bulk_expr), clinical$Sample)
+if (anyNA(idx)) stop("Missing samples: ",
+                     paste(colnames(bulk_expr)[is.na(idx)], collapse = ", "))
+grp <- trimws(clinical$Group[idx])
+
+phenotype <- ifelse(grp %in% config$hf_labels, 1L,
+             ifelse(grp == config$ctrl_label,   0L, NA_integer_))
+if (anyNA(phenotype)) stop("Unrecognized Group: ",
+                           paste(unique(grp[is.na(phenotype)]), collapse = ", "))
+if (length(unique(phenotype)) < 2) stop("Phenotype needs both classes.")
+log_msg("Phenotype: ", paste(names(table(phenotype)), table(phenotype),
+                             sep = "=", collapse = ", "))
+
+## 3. Gene harmonization
+shared <- intersect(rownames(bulk_expr), rownames(sc_data))
+if (length(shared) < 1000) warning("Only ", length(shared), " shared genes.")
+bulk_expr <- bulk_expr[shared, , drop = FALSE]
+sc_data   <- sc_data[shared, , drop = FALSE]
+log_msg("Shared genes: ", length(shared))
+
+## 4. Scissor
+scissor_res <- Scissor(bulk_expr, sc_data, phenotype = phenotype,
+                       alpha = config$alpha, family = config$family,
+                       nfold = config$nfold, parallel = TRUE, ncore = config$ncore)
+
+labels <- scissor_res$cell_labels
+if (is.null(labels)) labels <- scissor_res$Scissor_labels
+if (is.null(labels)) stop("No cell labels in Scissor output.")
+hf_processed$scissor <- labels
+log_msg("Labels: ", paste(names(table(labels)), table(labels), sep = "=", collapse = ", "))
+
+saveRDS(hf_processed, config$out_rds)
+saveRDS(scissor_res,  config$out_scissor)
+writeLines(capture.output(sessionInfo()),
+           file.path(config$log_dir, "sessionInfo_scissor_HF.txt"))
+close(log_con)

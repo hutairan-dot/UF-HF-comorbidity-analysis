@@ -1,0 +1,69 @@
+# ==============================================================================
+# Script: 06_nomogram_calibration_dca.R
+# Purpose: Multivariable logistic model on 7 core genes (GSE57338), nomogram via
+#          regplot, 1000x Bootstrap calibration, DCA + clinical impact curve,
+#          external validation on GSE116250 and GSE141910.
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(rms); library(regplot); library(dcurves); library(rmda); library(pROC)
+})
+set.seed(1234)
+
+core7 <- c("CPQ", "EIF4G1", "FCER1G", "PLAGL1", "AGFG1", "CREB5", "HIF1A")
+
+load_cohort <- function(expr_file, clin_file) {
+  expr <- read.table(expr_file, header = TRUE, row.names = 1, sep = "\t",
+                     check.names = FALSE)
+  expr <- as.matrix(expr); storage.mode(expr) <- "numeric"
+  clin <- read.csv(clin_file, stringsAsFactors = FALSE)
+  idx  <- match(colnames(expr), clin$Sample)
+  if (anyNA(idx)) stop(expr_file, ": missing samples.")
+  grp  <- trimws(clin$Group[idx])
+  y    <- ifelse(grp %in% c("HF", "ICM", "DCM"), 1L,
+          ifelse(grp == "Normal", 0L, NA_integer_))
+  if (anyNA(y)) stop(expr_file, ": unrecognized Group.")
+  d <- as.data.frame(t(expr[core7, , drop = FALSE]))
+  d$Y <- y
+  d
+}
+
+disc <- load_cohort("GSE57338_expression_matrix.txt",  "GSE57338_clinical.csv")
+v1   <- load_cohort("GSE116250_expression_matrix.txt", "GSE116250_clinical.csv")
+v2   <- load_cohort("GSE141910_expression_matrix.txt", "GSE141910_clinical.csv")
+
+dd <- datadist(disc); options(datadist = "dd")
+fit <- lrm(Y ~ CPQ + EIF4G1 + FCER1G + PLAGL1 + AGFG1 + CREB5 + HIF1A, data = disc)
+print(fit)
+
+## Nomogram
+pdf("nomogram_core7.pdf", width = 8, height = 6)
+regplot(fit, plots = c("density", "boxes"), observation = disc[1, core7],
+        title = "HF risk nomogram (7 core genes)", points = TRUE)
+dev.off()
+
+## Calibration (1000x Bootstrap)
+cal <- calibrate(fit, method = "boot", B = 1000)
+pdf("calibration_curve.pdf", width = 5, height = 5)
+plot(cal, xlab = "Predicted probability", ylab = "Observed probability",
+     main = "Calibration (Bootstrap = 1000)")
+abline(0, 1, lty = 2, col = "grey50")
+dev.off()
+
+## External validation AUC (expected 0.796 / 0.797)
+for (nm in c("v1", "v2")) {
+  d <- get(nm)
+  pred <- predict(fit, newdata = d, type = "fitted")
+  r <- roc(d$Y, pred, quiet = TRUE)
+  cat(nm, "AUC =", as.numeric(auc(r)), "\n")
+  pdf(paste0("ROC_", nm, ".pdf"), width = 4, height = 4)
+  plot(r, main = paste0(nm, " AUC = ", round(as.numeric(auc(r)), 3)))
+  dev.off()
+}
+
+## DCA (dcurves)
+dca_res <- dca(Y ~ CPQ + EIF4G1 + FCER1G + PLAGL1 + AGFG1 + CREB5 + HIF1A,
+               data = disc, thresholds = seq(0, 0.8, 0.01))
+pdf("DCA_core7.pdf", width = 5, height = 5)
+plot(dca_res) + theme_classic()
+dev.off()

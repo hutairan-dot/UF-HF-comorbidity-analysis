@@ -1,0 +1,65 @@
+# ==============================================================================
+# Script: 11_mediation_CPQ_THBS4_HF.R
+# Purpose: Mediation analysis in HF: X = CPQ, M = THBS4, Y = HF status.
+#          Z-score all continuous vars; 1000x nonparametric bootstrap.
+#          Discovery: GSE57338 ; Validation: GSE116250.
+# Expected: overall mediation proportion ~58.7% (Fig 7I)
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(mediation); library(dplyr)
+})
+set.seed(1234)
+
+run_mediation <- function(expr_file, clin_file, cohort) {
+  expr <- read.table(expr_file, header = TRUE, row.names = 1, sep = "\t",
+                     check.names = FALSE)
+  expr <- as.matrix(expr); storage.mode(expr) <- "numeric"
+  clin <- read.csv(clin_file, stringsAsFactors = FALSE)
+  idx  <- match(colnames(expr), clin$Sample)
+  if (anyNA(idx)) stop(cohort, ": missing samples in clinical file.")
+  grp  <- trimws(clin$Group[idx])
+  y    <- ifelse(grp %in% c("HF", "ICM", "DCM"), 1L,
+          ifelse(grp == "Normal", 0L, NA_integer_))
+  if (anyNA(y)) stop(cohort, ": unrecognized Group.")
+  if (length(unique(y)) < 2) stop(cohort, ": outcome needs both classes.")
+
+  if (!all(c("CPQ", "THBS4") %in% rownames(expr)))
+    stop(cohort, ": CPQ or THBS4 missing (check gene ID system).")
+
+  d <- data.frame(
+    Y = y,
+    X = as.numeric(expr["CPQ",   ]),
+    M = as.numeric(expr["THBS4", ]),
+    stringsAsFactors = FALSE
+  )
+  d$X <- as.numeric(scale(d$X)); d$M <- as.numeric(scale(d$M))
+
+  fit_m <- lm(M ~ X, data = d)
+  fit_y <- glm(Y ~ X + M, data = d, family = binomial())
+  med   <- mediate(fit_m, fit_y, treat = "X", mediator = "M",
+                   boot = TRUE, sims = 1000)
+  s <- summary(med)
+  data.frame(
+    cohort        = cohort,
+    ACME          = s$d.avg,
+    ACME_CI_low   = s$d.avg.ci[1],
+    ACME_CI_high  = s$d.avg.ci[2],
+    ACME_p        = s$d.avg.p,
+    ADE           = s$z.avg,
+    ADE_CI_low    = s$z.avg.ci[1],
+    ADE_CI_high   = s$z.avg.ci[2],
+    ADE_p         = s$z.avg.p,
+    Prop_mediated = s$n.avg,
+    Prop_CI_low   = s$n.avg.ci[1],
+    Prop_CI_high  = s$n.avg.ci[2],
+    Prop_p        = s$n.avg.p
+  )
+}
+
+res <- bind_rows(
+  run_mediation("GSE57338_expression_matrix.txt", "GSE57338_clinical.csv", "GSE57338"),
+  run_mediation("GSE116250_expression_matrix.txt", "GSE116250_clinical.csv", "GSE116250")
+)
+write.csv(res, "mediation_CPQ_THBS4_HF.csv", row.names = FALSE)
+print(res)

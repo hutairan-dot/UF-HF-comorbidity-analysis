@@ -1,0 +1,32 @@
+# ==============================================================================
+# Script: 02_clustergvis_modules.R
+# Purpose: ClusterGVis k-means co-expression modules across developmental states
+#          S1-S6 (Monocle pseudotime States; S1 = early, S6 = Terminal).
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(ClusterGVis); library(monocle); library(org.Hs.eg.db)
+})
+set.seed(1234)
+
+config <- list(
+  cds_rds   = "monocle_cds_UF.rds",   # Monocle object with State + pseudotime
+  state_col = "State",                # column holding S1-S6
+  genes     = c("CPQ", "THBS1", "HIF1A", "SATB1",
+                "COL1A1", "COL3A1", "FN1", "ACTA2"),
+  n_cluster = 4
+)
+
+cds <- readRDS(config$cds_rds)
+states <- pData(cds)[[config$state_col]]
+expr <- as.matrix(exprs(cds))
+ord <- order(pData(cds)$Pseudotime)
+state_levels <- paste0("S", 1:6)
+mat <- sapply(state_levels, function(s) rowMeans(expr[, states == s, drop = FALSE]))
+mat <- mat[intersect(config$genes, rownames(mat)), , drop = FALSE]
+
+ck <- clusterData(exp = mat, cluster.method = "kmeans",
+                  cluster.num = config$n_cluster)
+enrich <- enrichCluster(object = ck, OrgDb = org.Hs.eg.db,
+                        type = "BP", pvalueCutoff = 0.05)
+visCluster(object = ck, plot.type = "both")

@@ -1,0 +1,67 @@
+# ==============================================================================
+# Script: 08_fibrosis_correlation_pseudobulk.R
+# Purpose: CPQ vs fibrosis genes (Spearman) across 5 HF cohorts; Fibrosis
+#          signature score (Pearson); Nephroseq GFR correlation; E-MCs vs M-MCs
+#          pseudobulk Wilcoxon for CPQ/ACTA2/COL1A1/THBS1.
+# ==============================================================================
+
+suppressPackageStartupMessages({ library(dplyr); library(ggplot2) })
+set.seed(1234)
+
+config <- list(
+  hf_cohorts = c("GSE141910", "GSE1869", "GSE5406", "GSE116250", "GSE57338"),
+  fibrosis_gmt = "fibrosis_signature.gmt",   # <- supply your gene set file
+  uf_rds = "GSE248762_Scissor_projected_alpha0001.rds",
+  emc_label = "E-MCs", mmc_label = "M-MCs",
+  target_genes = c("CPQ", "ACTA2", "COL1A1", "THBS1")
+)
+
+read_expr <- function(cohort) {
+  f <- paste0(cohort, "_expression_matrix.txt")
+  e <- read.table(f, header = TRUE, row.names = 1, sep = "\t", check.names = FALSE)
+  as.matrix(e)
+}
+
+## 1. CPQ vs fibrosis genes (Spearman) in 5 HF cohorts
+fib_genes <- unique(unlist(strsplit(readLines(config$fibrosis_gmt), "\t")[[1]][-c(1, 2)]))
+sp_res <- lapply(config$hf_cohorts, function(co) {
+  e <- read_expr(co)
+  if (!"CPQ" %in% rownames(e)) return(NULL)
+  do.call(rbind, lapply(intersect(fib_genes, rownames(e)), function(g) {
+    t <- cor.test(e["CPQ", ], e[g, ], method = "spearman")
+    data.frame(cohort = co, gene = g, rho = unname(t$estimate), p = t$p.value)
+  }))
+}) |> bind_rows()
+write.csv(sp_res, "CPQ_fibrosis_spearman.csv", row.names = FALSE)
+
+## 2. Fibrosis signature score vs CPQ (Pearson)
+sig_res <- lapply(config$hf_cohorts, function(co) {
+  e <- read_expr(co)
+  g <- intersect(fib_genes, rownames(e)); if (length(g) < 3) return(NULL)
+  score <- colMeans(scale(t(e[g, , drop = FALSE])))
+  t <- cor.test(score, e["CPQ", ], method = "pearson")
+  data.frame(cohort = co, r = unname(t$estimate), p = t$p.value)
+}) |> bind_rows()
+write.csv(sig_res, "CPQ_fibrosis_signature_pearson.csv", row.names = FALSE)
+
+## 3. Pseudobulk E-MCs vs M-MCs (UF)
+uf <- readRDS(config$uf_rds)
+md <- uf@meta.data
+md$celltype <- as.character(md$celltype)
+sub <- md[md$celltype %in% c(config$emc_label, config$mmc_label), ]
+expr <- GetAssayData(uf, layer = "data")[config$target_genes, rownames(sub)]
+pb <- sapply(split(seq_len(nrow(sub)), sub$patient), function(ix) {
+  rowMeans(expr[, ix, drop = FALSE])
+})
+pb <- as.data.frame(t(pb))
+pb$celltype <- sapply(split(sub$celltype, sub$patient), `[`, 1)
+pb <- pb[!is.na(pb$celltype), ]
+
+wilcox_res <- lapply(config$target_genes, function(g) {
+  a <- pb[pb$celltype == config$mmc_label, g]
+  b <- pb[pb$celltype == config$emc_label, g]
+  t <- wilcox.test(a, b)
+  data.frame(gene = g, W = unname(t$statistic), p = t$p.value,
+             n_MMC = length(a), n_EMC = length(b))
+}) |> bind_rows()
+write.csv(wilcox_res, "pseudobulk_EMC_vs_MMC.csv", row.names = FALSE)

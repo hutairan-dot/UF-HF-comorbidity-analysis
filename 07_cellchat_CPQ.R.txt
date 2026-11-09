@@ -1,0 +1,59 @@
+# ==============================================================================
+# Script: 07_cellchat_CPQ.R
+# Purpose: CPQ High/Low CellChat in UF (Fibroblast, M-MCs, T_cell) and
+#          HF (Fibroblast); NMF patterns; centrality; shared THBS axis.
+#          CPQ detection rate reported: UF 36.29% / HF 68.54%.
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat); library(CellChat); library(ComplexHeatmap); library(dplyr)
+})
+set.seed(1234)
+
+config <- list(
+  uf_rds = "GSE248762_Scissor_projected_alpha0001.rds",
+  hf_rds = "GSE298023_Scissor_projected_alpha0001.rds",
+  uf_types = c("Fibroblast", "M-MCs", "T_cell"),   # <- confirm exact strings
+  hf_types = c("Fibroblast"),                        # <- confirm exact strings
+  id_col   = "celltype",                             # <- confirm metadata column
+  k_pattern = 3
+)
+
+check_types <- function(obj, want, tag) {
+  lv <- unique(as.character(obj@meta.data[[config$id_col]]))
+  miss <- setdiff(want, lv)
+  if (length(miss) > 0)
+    stop(tag, ": cell type strings not found in metadata: ",
+         paste(miss, collapse = ", "),
+         "\nAvailable: ", paste(lv, collapse = ", "))
+}
+
+run_cellchat <- function(obj, types, tag) {
+  check_types(obj, types, tag)
+  sub <- subset(obj, cells = rownames(obj@meta.data)[
+    obj@meta.data[[config$id_col]] %in% types])
+  cpq <- GetAssayData(sub, layer = "data")["CPQ", ]
+  det <- mean(cpq > 0)
+  message(tag, " CPQ detection rate: ", round(det * 100, 2), "%")
+  sub$CPQ_group <- ifelse(cpq > median(cpq), "CPQ_High", "CPQ_Low")
+
+  cc <- createCellChat(object = sub, group.by = "CPQ_group")
+  cc@DB <- CellChatDB.human
+  cc <- subsetData(cc); cc <- identifyOverExpressedGenes(cc)
+  cc <- identifyOverExpressedInteractions(cc)
+  cc <- computeCommunProb(cc); cc <- filterCommunication(cc, min.cells = 10)
+  cc <- computeCommunProbPathway(cc); cc <- aggregateNet(cc)
+  cc <- netAnalysis_computeCentrality(cc, slot.name = "netP")
+
+  cc <- identifyCommunicationPatterns(cc, pattern = "outgoing", k = config$k_pattern)
+  cc <- identifyCommunicationPatterns(cc, pattern = "incoming", k = config$k_pattern)
+  list(cellchat = cc, detection = det)
+}
+
+uf <- readRDS(config$uf_rds)
+hf <- readRDS(config$hf_rds)
+res_uf <- run_cellchat(uf, config$uf_types, "UF")
+res_hf <- run_cellchat(hf, config$hf_types, "HF")
+
+saveRDS(res_uf, "cellchat_UF_CPQ.rds")
+saveRDS(res_hf, "cellchat_HF_CPQ.rds")

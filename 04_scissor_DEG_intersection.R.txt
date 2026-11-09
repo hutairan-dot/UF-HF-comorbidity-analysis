@@ -1,0 +1,41 @@
+# ==============================================================================
+# Script: 04_scissor_DEG_intersection.R
+# Purpose: Global DEG of Scissor+ vs Scissor- in UF and HF; intersect up-regulated
+#          genes (p.adj < 0.05 & log2FC > 2) -> comorbid candidate gene set.
+# Expected: UF 1,644 up / HF 552 up / intersection 418 (Result Fig 1C,1F,1G)
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(Seurat); library(dplyr)
+})
+set.seed(1234)
+
+uf <- readRDS("GSE248762_Scissor_projected_alpha0001.rds")
+hf <- readRDS("GSE298023_Scissor_projected_alpha0001.rds")
+
+run_deg <- function(obj, tag) {
+  Idents(obj) <- factor(obj$scissor, levels = c("Scissor-", "Scissor+", "Neutral"))
+  obj <- subset(obj, idents = c("Scissor-", "Scissor+"))
+  Idents(obj) <- droplevels(Idents(obj))
+  deg <- FindMarkers(obj, ident.1 = "Scissor+", ident.2 = "Scissor-",
+                     logfc.threshold = 0, min.pct = 0.1, test.use = "wilcox")
+  deg$gene <- rownames(deg)
+  deg$comparison <- tag
+  deg
+}
+
+deg_uf <- run_deg(uf, "UF")
+deg_hf <- run_deg(hf, "HF")
+
+up_uf <- deg_uf %>% filter(p_val_adj < 0.05, avg_log2FC > 2) %>% pull(gene)
+up_hf <- deg_hf %>% filter(p_val_adj < 0.05, avg_log2FC > 2) %>% pull(gene)
+candidate <- intersect(up_uf, up_hf)
+
+message("UF up: ", length(up_uf), " | HF up: ", length(up_hf),
+        " | intersection: ", length(candidate))
+
+write.csv(deg_uf, "DEG_UF_ScissorPos_vs_Neg.csv", row.names = FALSE)
+write.csv(deg_hf, "DEG_HF_ScissorPos_vs_Neg.csv", row.names = FALSE)
+writeLines(candidate, "comorbid_candidate_genes.txt")
+saveRDS(list(UF = up_uf, HF = up_hf, intersection = candidate),
+        "comorbid_candidate_genes.rds")

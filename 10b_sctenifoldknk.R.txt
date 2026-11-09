@@ -1,0 +1,37 @@
+# ==============================================================================
+# Script: 10b_sctenifoldknk.R
+# Purpose: Virtual knockout of CPQ, EBF2, GLI3, THBS4 (HF) and CPQ, HIF1A, SATB1,
+#          THBS1 (UF) via scTenifoldKnk; q < 0.01 & |Z| > 1.8.
+# Expected cascade: HF CPQ -> EBF2/GLI3 -> THBS4 ; UF CPQ -> HIF1A/SATB1 -> THBS1
+# ==============================================================================
+suppressPackageStartupMessages({ library(scTenifoldKnk); library(Seurat) })
+set.seed(1234)
+
+config <- list(
+  uf_rds = "GSE248762_Scissor_projected_alpha0001.rds",
+  hf_rds = "GSE298023_Scissor_projected_alpha0001.rds",
+  ko_uf  = c("CPQ", "HIF1A", "SATB1", "THBS1"),
+  ko_hf  = c("CPQ", "EBF2", "GLI3", "THBS4"),
+  nc_nNet = 10, nc_nCells = 500,
+  q_cut = 0.01, z_cut = 1.8
+)
+
+run_ko <- function(obj, gene, tag) {
+  cnt <- GetAssayData(obj, layer = "counts")
+  res <- scTenifoldKnk(countMatrix = as.matrix(cnt),
+                       gKO = gene,
+                       qc = FALSE,
+                       nc_nNet = config$nc_nNet,
+                       nc_nCells = config$nc_nCells)
+  dr <- res$diffRegulation
+  sig <- dr[dr$q.value < config$q_cut & abs(dr$Z) > config$z_cut, ]
+  write.csv(sig, paste0("scTenifoldKnk_", tag, "_KO_", gene, ".csv"))
+  message(tag, " KO ", gene, ": ", nrow(sig), " DR genes")
+  sig
+}
+
+uf <- readRDS(config$uf_rds)
+hf <- readRDS(config$hf_rds)
+
+for (g in config$ko_uf) run_ko(uf, g, "UF")
+for (g in config$ko_hf) run_ko(hf, g, "HF")

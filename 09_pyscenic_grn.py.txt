@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# Script: 09_pyscenic_grn.py
+# Purpose: pySCENIC v0.12.1 GRN inference for THBS1 (UF) / THBS4 (HF) upstream TFs
+#          and CPQ-high differential TF activity (Wilcoxon + BH, ΔMean > 0).
+# Expected: UF THBS1 upstream -> HIF1A, TPI1 ; HF THBS4 upstream -> LEF1, KCNIP1
+#           CPQ-high diff TFs: UF SATB1/HIF1A ; HF TRPS1/EBF2/GLI3/RUNX1/RUNX2
+# ==============================================================================
+import os, subprocess, pandas as pd, numpy as np
+from pyscenic.aucell import aucell
+from pyscenic.utils import modules_from_adjacencies
+from pyscenic.prune import prune2df
+from pyscenic.rnkdb import FeatherRankingDatabase as RankDb
+from ctxcore.rnkdb import FeatherRankingDatabase
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+
+# ---- Configuration -----------------------------------------------------------
+CONFIG = {
+    "loom_uf": "GSE248762_ScissorPlus_MMC.loom",
+    "loom_hf": "GSE298023_ScissorPlus_Fib.loom",
+    "tf_list": "allTFs_hg38.txt",
+    "db_10kb": "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.genes_vs_motifs.rankings.feather",
+    "db_500bp": "hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.genes_vs_motifs.rankings.feather",
+    "motif_annot": "motifs-v9-nr.hgnc-m0.001-o0.0.tbl",
+    "num_workers": 20,
+    "seed": 1234,
+    "out_dir": "pyscenic_out"
+}
+os.makedirs(CONFIG["out_dir"], exist_ok=True)
+
+# ---- Download databases (run once) ------------------------------------------
+# wget https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.genes_vs_motifs.rankings.feather
+# wget https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg38/refseq_r80/mc9nr/gene_based/hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.genes_vs_motifs.rankings.feather
+# wget https://resources.aertslab.org/cistarget/motif2tf/motifs-v9-nr.hgnc-m0.001-o0.0.tbl
+# wget https://resources.aertslab.org/cistarget/tf_lists/allTFs_hg38.txt
+
+# ---- Step 1: GRNBoost2 via multiprocessing (Dask-free, stable) ---------------
+def run_grnboost(loom_path, tag):
+    adj_file = f"{CONFIG['out_dir']}/adj_{tag}.tsv"
+    cmd = [
+        "arboreto_with_multiprocessing.py", loom_path, CONFIG["tf_list"],
+        "--method", "grnboost2",
+        "--output", adj_file,
+        "--num_workers", str(CONFIG["num_workers"]),
+        "--seed", str(CONFIG["seed"])
+    ]
+    print(f"[{tag}] Running GRNBoost2 (multiprocessing)...")
+    subprocess.run(cmd, check=True)
+    return adj_file
+
+# ---- Step 2: cisTarget pruning ----------------------------------------------
+def run_cistarget(adj_file, tag):
+    adj = pd.read_csv(adj_file, sep="\t", index_col=[0, 1])["importance"].reset_index()
+    adj.columns = ["TF", "target", "importance"]
+
+    dbs = [FeatherRankingDatabase(CONFIG["db_10kb"]),
+           FeatherRankingDatabase(CONFIG["db_500bp"])]
+
+    modules = list(modules_from_adjacencies(adj, expression_df=None,
+                                            rho_mask_dropouts=False))
+    df = prune2df(dbs, modules, CONFIG["motif_annot"],
+                  num_workers=CONFIG["num_workers"])
+    df.to_csv(f"{CONFIG['out_dir']}/regulons_{tag}.csv")
+    return df
+
+# ---- Step 3: AUCell scoring --------------------------------------------------
+def run_aucell(loom_path, regulon_csv, tag):
+    import loompy
+    with loompy.connect(loom_path) as ds:
+        expr = pd.DataFrame(ds[:, :], index=ds.ra["Gene"], columns=ds.ca["CellID"])
+
+    reg = pd.read_csv(regulon_csv, index_col=0)
+    regulons = {tf: list(reg.columns[reg.loc[tf] > 0]) for tf in reg.index}
+
+    auc = aucell(expr, regulons, num_workers=CONFIG["num_workers"], seed=CONFIG["seed"])
+    auc.to_csv(f"{CONFIG['out_dir']}/aucell_{tag}.csv")
+    return auc
+
+# ---- Step 4: CPQ-high vs CPQ-low differential TF (Wilcoxon + BH, ΔMean > 0) --
+def diff_tf(auc_df, cpq_high_cells, cpq_low_cells, tag):
+    res = []
+    for tf in auc_df.index:
+        a = auc_df.loc[tf, cpq_high_cells]
+        b = auc_df.loc[tf, cpq_low_cells]
+        stat, p = mannwhitneyu(a, b, alternative="greater")
+        res.append({"TF": tf, "mean_high": a.mean(), "mean_low": b.mean(),
+                    "delta_mean": a.mean() - b.mean(), "p": p})
+    df = pd.DataFrame(res)
+    df["padj"] = multipletests(df["p"], method="fdr_bh")[1]
+    df = df[(df["padj"] < 0.05) & (df["delta_mean"] > 0)].sort_values("padj")
+    df.to_csv(f"{CONFIG['out_dir']}/diff_TF_{tag}.csv", index=False)
+    return df
+
+# ---- Main --------------------------------------------------------------------
+if __name__ == "__main__":
+    for tag, loom in [("UF", CONFIG["loom_uf"]), ("HF", CONFIG["loom_hf"])]:
+        print(f"===== Processing {tag} =====")
+        adj = run_grnboost(loom, tag)
+        run_cistarget(adj, tag)
+        run_aucell(loom, f"{CONFIG['out_dir']}/regulons_{tag}.csv", tag)

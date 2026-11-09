@@ -1,0 +1,119 @@
+# ==============================================================================
+# Script: 05_ml_lasso_rf_svmrfe_shap.R
+# Purpose: Three-algorithm feature selection (LASSO / RF / SVM-RFE) on the
+#          comorbid candidate gene set, intersect to core genes, then SHAP
+#          interpretation of the probability-forest model (R: shapr + ranger).
+# Core genes (confirmed): CPQ, EIF4G1, FCER1G, PLAGL1, AGFG1, CREB5, HIF1A
+# Discovery cohort: GSE57338 (313 LV samples: 177 HF / 136 control)
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(glmnet); library(randomForest); library(e1071)
+  library(ranger); library(shapr); library(dplyr); library(ggplot2)
+})
+set.seed(1234)
+
+config <- list(
+  expr_file  = "GSE57338_expression_matrix.txt",
+  clin_file  = "GSE57338_clinical.csv",
+  cand_file  = "comorbid_candidate_genes.txt",
+  out_dir    = "results_ml",
+  lasso_fold = 10, rf_ntree = 500, rf_top = 30, svm_top = 10,
+  shap_n_explain = 200, shap_n_background = 100
+)
+dir.create(config$out_dir, showWarnings = FALSE)
+
+## 1. Data
+expr <- read.table(config$expr_file, header = TRUE, row.names = 1, sep = "\t",
+                   check.names = FALSE)
+expr <- as.matrix(expr); storage.mode(expr) <- "numeric"
+clin <- read.csv(config$clin_file, stringsAsFactors = FALSE)
+idx  <- match(colnames(expr), clin$Sample)
+if (anyNA(idx)) stop("Missing clinical samples.")
+grp  <- trimws(clin$Group[idx])
+y    <- ifelse(grp %in% c("HF", "ICM", "DCM"), 1L,
+        ifelse(grp == "Normal", 0L, NA_integer_))
+if (anyNA(y) || length(unique(y)) < 2) stop("Outcome must be binary 0/1.")
+
+candidates <- readLines(config$cand_file)
+candidates <- intersect(candidates, rownames(expr))
+X <- t(expr[candidates, , drop = FALSE])
+message("Candidate genes used: ", ncol(X), " | samples: ", nrow(X))
+
+## 2. LASSO (10-fold CV, lambda.min & lambda.1se)
+cvfit <- cv.glmnet(X, y, family = "binomial", nfolds = config$lasso_fold, alpha = 1)
+coef_min <- coef(cvfit, s = "lambda.min"); coef_1se <- coef(cvfit, s = "lambda.1se")
+lasso_min <- rownames(coef_min)[which(coef_min != 0)][-1]
+lasso_1se <- rownames(coef_1se)[which(coef_1se != 0)][-1]
+message("LASSO lambda.min: ", length(lasso_min), " | lambda.1se: ", length(lasso_1se))
+
+## 3. Random forest (ntree=500, top-N by MeanDecreaseGini)
+df_rf <- data.frame(X, y = factor(y, levels = c(0, 1)))
+rf <- randomForest(y ~ ., data = df_rf, ntree = config$rf_ntree, importance = TRUE)
+imp <- importance(rf, type = 2)[, 1]
+rf_top <- names(sort(imp, decreasing = TRUE))[seq_len(min(config$rf_top, length(imp)))]
+
+## 4. SVM-RFE (10-fold CV, linear kernel)
+svm_rfe <- function(X, y, nfold = 10, n_keep = 10) {
+  feats <- colnames(X)
+  foldid <- sample(rep(seq_len(nfold), length.out = nrow(X)))
+  while (length(feats) > n_keep) {
+    acc <- sapply(feats, function(f) {
+      mean(sapply(seq_len(nfold), function(k) {
+        tr <- foldid != k
+        m  <- svm(x = X[tr, feats != f, drop = FALSE], y = y[tr],
+                  kernel = "linear", cost = 1)
+        pred <- predict(m, X[!tr, feats != f, drop = FALSE])
+        mean(pred == y[!tr])
+      }))
+    })
+    drop_f <- names(which.min(acc))
+    feats  <- setdiff(feats, drop_f)
+  }
+  feats
+}
+svm_top <- svm_rfe(X, y, nfold = 10, n_keep = config$svm_top)
+
+## 5. Intersection
+core <- Reduce(intersect, list(lasso_min, rf_top, svm_top))
+message("Core genes (intersection): ", paste(core, collapse = ", "))
+
+confirmed7 <- c("CPQ", "EIF4G1", "FCER1G", "PLAGL1", "AGFG1", "CREB5", "HIF1A")
+missing <- setdiff(confirmed7, core)
+if (length(missing) > 0)
+  warning("Confirmed 7 genes not all recovered from intersection: ",
+          paste(missing, collapse = ", "))
+
+write.csv(data.frame(gene = core), file.path(config$out_dir, "core_genes.csv"),
+          row.names = FALSE)
+write.csv(data.frame(gene = lasso_min), file.path(config$out_dir, "lasso_min.csv"), row.names = FALSE)
+write.csv(data.frame(gene = rf_top),   file.path(config$out_dir, "rf_top.csv"),   row.names = FALSE)
+write.csv(data.frame(gene = svm_top),  file.path(config$out_dir, "svm_top.csv"),  row.names = FALSE)
+
+## 6. SHAP on probability forest (ranger, probability = TRUE)
+X7 <- X[, confirmed7, drop = FALSE]
+set.seed(1234)
+idx_bg <- sample(seq_len(nrow(X7)), min(config$shap_n_background, nrow(X7)))
+idx_ex <- sample(seq_len(nrow(X7)), min(config$shap_n_explain,    nrow(X7)))
+
+pf <- ranger(x = X7[-idx_bg, , drop = FALSE], y = factor(y[-idx_bg]),
+             probability = TRUE, num.trees = 500, importance = "permutation")
+
+explainer <- shapr(X7[-idx_bg, , drop = FALSE], pf,
+                   predict_model = function(m, newdata) {
+                     predict(m, data = as.data.frame(newdata))$predictions[, "1"]
+                   })
+shap_res <- explain(X7[idx_ex, , drop = FALSE], explainer,
+                    approach = "kernelshap",
+                    pred_wrapper = function(m, newdata) {
+                      predict(m, data = as.data.frame(newdata))$predictions[, "1"]
+                    },
+                    n_combinations = 200)
+
+shap_df <- as.data.frame(shap_res$dt)
+write.csv(shap_df, file.path(config$out_dir, "shap_values.csv"), row.names = FALSE)
+
+p_global <- shap_res |>
+  plot(shap_plot_type = "bar") +
+  theme_classic()
+ggsave(file.path(config$out_dir, "shap_global_bar.pdf"), p_global, width = 5, height = 4)

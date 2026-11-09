@@ -1,0 +1,44 @@
+# ==============================================================================
+# Script: 12_statistics_utils.R
+# Purpose: Shared statistics helpers and publication theme.
+# Source this file at the top of analysis scripts.
+# ==============================================================================
+
+suppressPackageStartupMessages({ library(ggplot2) })
+
+#' Wilcoxon rank-sum test returning a tidy data.frame
+run_wilcox <- function(x, y, paired = FALSE) {
+  t <- wilcox.test(x, y, paired = paired)
+  data.frame(W = unname(t$statistic), p = t$p.value)
+}
+
+#' Spearman correlation returning estimate, p and n
+run_spearman <- function(x, y) {
+  t <- cor.test(x, y, method = "spearman")
+  data.frame(rho = unname(t$estimate), p = t$p.value, n = length(x))
+}
+
+#' Pearson correlation returning estimate, p and n
+run_pearson <- function(x, y) {
+  t <- cor.test(x, y, method = "pearson")
+  data.frame(r = unname(t$estimate), p = t$p.value, n = length(x))
+}
+
+#' BH adjustment wrapper
+bh_adjust <- function(p) p.adjust(p, method = "BH")
+
+#' Significance stars (matches Methods: p<0.05, p<0.01, p<0.001)
+p_stars <- function(p) {
+  ifelse(p < 0.001, "***", ifelse(p < 0.01, "**", ifelse(p < 0.05, "*", "ns")))
+}
+
+#' Unified ggplot2 theme
+theme_publication <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.text  = element_text(colour = "black"),
+      axis.title = element_text(colour = "black"),
+      strip.background = element_blank(),
+      legend.key = element_blank()
+    )
+}

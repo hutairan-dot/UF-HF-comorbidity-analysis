@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# Script: 10a_geneformer.py
+# Purpose: Geneformer V2 transcriptome embeddings + L2 logistic classifier
+#          (7:3 split, F1 + confusion matrix) for Scissor+ M-MCs (UF) and
+#          Scissor+ Fibroblasts (HF).
+# Expected: UF F1 = 0.85 ; HF F1 = 0.94
+# ==============================================================================
+import os, pickle, numpy as np, pandas as pd, torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+from geneformer import TranscriptomeTokenizer, EmbExtractor
+
+CONFIG = {
+    "model_dir": "Geneformer/Geneformer-V2-104M",  # from ctheodoris/Geneformer
+    "uf_adata": "UF_scissor_target.h5ad",
+    "hf_adata": "HF_scissor_target.h5ad",
+    "out_dir": "geneformer_out",
+    "test_size": 0.3,
+    "seed": 1234
+}
+os.makedirs(CONFIG["out_dir"], exist_ok=True)
+
+def tokenize_and_embed(adata_path, tag):
+    """Convert h5ad -> loom -> Geneformer token dataset -> embeddings."""
+    import scanpy as sc
+    adata = sc.read_h5ad(adata_path)
+    # Geneformer requires: gene symbols as var_names, raw counts in X
+    adata.var["ensembl_id"] = adata.var_names  # adjust if Ensembl IDs needed
+    adata.obs["n_counts"] = adata.X.sum(axis=1).A1 if hasattr(adata.X, "A1") else adata.X.sum(axis=1)
+
+    loom_path = f"{CONFIG['out_dir']}/{tag}.loom"
+    adata.write_loom(loom_path)
+
+    tk = TranscriptomeTokenizer({"cell_type": "cell_type", "n_counts": "n_counts"},
+                                 nproc=8)
+    token_ds = f"{CONFIG['out_dir']}/{tag}_tokenized.dataset"
+    tk.tokenize_data(os.path.dirname(loom_path), CONFIG["out_dir"],
+                     f"{tag}_tokenized", file_format="loom")
+
+    em = EmbExtractor(model_type="CellClassifier",
+                      num_classes=2,
+                      filter_data=None,
+                      max_ncells=None,
+                      emb_layer=0,
+                      summary_stat="mean",
+                      forward_batch_size=200,
+                      nproc=8)
+    em.extract_embs(CONFIG["model_dir"],
+                    f"{CONFIG['out_dir']}/{tag}_tokenized.dataset",
+                    f"{CONFIG['out_dir']}/{tag}_emb.pkl",
+                    f"{CONFIG['out_dir']}/{tag}_emb.csv")
+    return pd.read_csv(f"{CONFIG['out_dir']}/{tag}_emb.csv", index_col=0)
+
+def classify(emb_df, labels, tag):
+    X = emb_df.values
+    y = labels
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=CONFIG["test_size"],
+                                               random_state=CONFIG["seed"], stratify=y)
+    clf = LogisticRegression(penalty="l2", max_iter=1000, random_state=CONFIG["seed"])
+    clf.fit(X_tr, y_tr)
+    y_pred = clf.predict(X_te)
+    f1 = f1_score(y_te, y_pred, average="weighted")
+    cm = confusion_matrix(y_te, y_pred)
+    print(f"[{tag}] F1 = {f1:.4f}")
+    print(classification_report(y_te, y_pred))
+    pd.DataFrame(cm).to_csv(f"{CONFIG['out_dir']}/confusion_{tag}.csv")
+    return f1
+
+if __name__ == "__main__":
+    for tag, adata in [("UF", CONFIG["uf_adata"]), ("HF", CONFIG["hf_adata"])]:
+        emb = tokenize_and_embed(adata, tag)
+        # labels: Scissor+ = 1, Scissor- / Neutral = 0 (adjust per your metadata)
+        import scanpy as sc
+        adata_obj = sc.read_h5ad(adata)
+        labels = (adata_obj.obs["scissor"] == "Scissor+").astype(int).values
+        classify(emb, labels, tag)
